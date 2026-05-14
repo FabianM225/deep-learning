@@ -9,4 +9,4 @@ anndata
 medmnist
 matplotlib
 scikit-learn
-umpap-learn
+umap-learn
