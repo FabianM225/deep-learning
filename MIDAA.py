@@ -5,11 +5,14 @@ Usage:
     python MIDAA.py --dataset mnist
     python MIDAA.py --dataset blood --subset 0.4 --steps 1500
     python MIDAA.py --dataset paul15 --steps 1500
+    python MIDAA.py --dataset neurips2021 --steps 1500
 
 Saves: results/midaa_{dataset}_results.pt
 
 Dependencies:
     pip install midaa anndata scanpy umap-learn
+    For neurips2021: place GSE194122_openproblems_neurips2021_multiome_BMMC_processed.h5ad
+    in ./data/ or install kagglehub for automatic download.
 """
 
 import argparse
@@ -82,6 +85,51 @@ def load_blood(subset):
     adata = ad.AnnData(X_sub)
     adata.obs['label'] = y_sub.astype(str)
     return adata, y_sub
+
+
+def load_neurips2021(subset):
+    import scanpy as sc
+    import scipy.sparse as sp
+    fn = './data/GSE194122_openproblems_neurips2021_multiome_BMMC_processed.h5ad'
+    if not os.path.exists(fn):
+        try:
+            import kagglehub
+            import glob as _glob
+            path = kagglehub.dataset_download(
+                'alexandervc/scrnaseq-scatacseq-challenge-at-neurips-2021',
+                force_download=False)
+            candidates = _glob.glob(os.path.join(path, '**', '*.h5ad'), recursive=True)
+            if candidates:
+                fn = candidates[0]
+        except Exception:
+            raise FileNotFoundError(
+                f'NeurIPS 2021 h5ad not found at {fn!r}. '
+                'Place the file at ./data/ or install kagglehub for automatic download.')
+    adata_full = sc.read(fn)
+    n_obs = max(100, int(subset * 10000))
+    adata = sc.pp.subsample(adata_full, n_obs=n_obs, copy=True, random_state=42)
+
+    labels_raw = adata.obs['cell_type'].astype(str).values
+    unique_labels = sorted(set(labels_raw))
+    label_map = {l: i for i, l in enumerate(unique_labels)}
+    y = np.array([label_map[l] for l in labels_raw], dtype=int)
+
+    # Same HVG pipeline as paul15
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+    sc.pp.highly_variable_genes(adata, n_top_genes=2000)
+    adata = adata[:, adata.var['highly_variable']].copy()
+
+    X = adata.X.toarray() if sp.issparse(adata.X) else np.array(adata.X)
+    X = X.astype(np.float32)
+    X_min, X_max = X.min(axis=0), X.max(axis=0)
+    X = (X - X_min) / np.where(X_max - X_min > 0, X_max - X_min, 1.0)
+    gene_names = adata.var_names.tolist()
+
+    adata_sub = ad.AnnData(X)
+    adata_sub.obs['label'] = labels_raw
+    adata_sub.uns['gene_names'] = gene_names
+    return adata_sub, y
 
 
 def load_paul15(subset):
@@ -259,7 +307,8 @@ def run_sweep(X_dense, name, output_dim, n_arc_list, n_runs, n_arc_consistency,
 
 def main():
     parser = argparse.ArgumentParser(description='MIDAA training script')
-    parser.add_argument('--dataset', required=True, choices=['mnist', 'blood', 'paul15'],
+    parser.add_argument('--dataset', required=True,
+                        choices=['mnist', 'blood', 'paul15', 'neurips2021'],
                         help='Dataset to train on')
     parser.add_argument('--subset', type=float, default=None,
                         help='Fraction of per-class data. Default: 0.2 (mnist), 0.4 (blood)')
@@ -279,9 +328,10 @@ def main():
     args = parser.parse_args()
 
     defaults = {
-        'mnist':   {'subset': 0.1, 'n_arc_consistency': 10},
-        'blood':   {'subset': 0.4, 'n_arc_consistency': 8},
-        'paul15':  {'subset': 1.0, 'n_arc_consistency': 10},
+        'mnist':        {'subset': 0.1, 'n_arc_consistency': 10},
+        'blood':        {'subset': 0.4, 'n_arc_consistency': 8},
+        'paul15':       {'subset': 1.0, 'n_arc_consistency': 10},
+        'neurips2021':  {'subset': 1.0, 'n_arc_consistency': 10},
     }
     if args.subset is None:
         args.subset = defaults[args.dataset]['subset']
@@ -293,13 +343,19 @@ def main():
     n_arc_list = list(range(args.n_arc_min, args.n_arc_max))
 
     print(f'\n====  {args.dataset.upper()}  (subset={args.subset}) ====')
-    loaders = {'mnist': load_mnist, 'blood': load_blood, 'paul15': load_paul15}
+    loaders = {
+        'mnist':       load_mnist,
+        'blood':       load_blood,
+        'paul15':      load_paul15,
+        'neurips2021': load_neurips2021,
+    }
     adata, y = loaders[args.dataset](args.subset)
 
     dataset_meta = {
-        'mnist':  {'name': 'MNIST',   'output_dim': 784},
-        'blood':  {'name': 'Blood',   'output_dim': 2352},
-        'paul15': {'name': 'Paul15',  'output_dim': adata.X.shape[1]},
+        'mnist':       {'name': 'MNIST',        'output_dim': 784},
+        'blood':       {'name': 'Blood',         'output_dim': 2352},
+        'paul15':      {'name': 'Paul15',        'output_dim': adata.X.shape[1]},
+        'neurips2021': {'name': 'NeurIPS 2021',  'output_dim': adata.X.shape[1]},
     }
     name = dataset_meta[args.dataset]['name']
     output_dim = dataset_meta[args.dataset]['output_dim']

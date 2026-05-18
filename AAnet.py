@@ -25,6 +25,54 @@ from utils import ArchetypeConsistency, preprocess
 # Data loading
 # ---------------------------------------------------------------------------
 
+def load_neurips2021(subset):
+    import scanpy as sc
+    import scipy.sparse as sp
+    fn = './data/GSE194122_openproblems_neurips2021_multiome_BMMC_processed.h5ad'
+    if not os.path.exists(fn):
+        try:
+            import kagglehub
+            import glob as _glob
+            path = kagglehub.dataset_download(
+                'alexandervc/scrnaseq-scatacseq-challenge-at-neurips-2021',
+                force_download=False)
+            candidates = _glob.glob(os.path.join(path, '**', '*.h5ad'), recursive=True)
+            if candidates:
+                fn = candidates[0]
+        except Exception:
+            raise FileNotFoundError(
+                f'NeurIPS 2021 h5ad not found at {fn!r}. '
+                'Place the file at ./data/ or install kagglehub for automatic download.')
+    adata_full = sc.read(fn)
+    n_obs = max(100, int(subset * 10000))
+    adata = sc.pp.subsample(adata_full, n_obs=n_obs, copy=True, random_state=42)
+
+    labels_raw = adata.obs['cell_type'].astype(str).values
+    unique_labels = sorted(set(labels_raw))
+    label_map = {l: i for i, l in enumerate(unique_labels)}
+    y = np.array([label_map[l] for l in labels_raw], dtype=int)
+
+    # Same HVG pipeline as paul15
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+    sc.pp.highly_variable_genes(adata, n_top_genes=2000)
+    adata = adata[:, adata.var['highly_variable']].copy()
+
+    X = adata.X.toarray() if sp.issparse(adata.X) else np.array(adata.X)
+    X = X.astype(np.float32)
+    X_min, X_max = X.min(axis=0), X.max(axis=0)
+    X = (X - X_min) / np.where(X_max - X_min > 0, X_max - X_min, 1.0)
+    X = X * 2 - 1  # [0,1] → [-1,1]
+    gene_names = adata.var_names.tolist()
+    data = torch.from_numpy(X).float()
+    N = len(data)
+    perm = torch.randperm(N)
+    perm_np = perm.numpy()
+    t, v = int(0.7 * N), int(0.85 * N)
+    return (data[perm[:t]], data[perm[t:v]], data[perm[v:]],
+            y[perm_np], labels_raw[perm_np], gene_names)
+
+
 def load_paul15(subset):
     import scanpy as sc
     import scipy.sparse as sp
@@ -202,7 +250,8 @@ def repeated_runs(X_all, input_shape, device, best_k, R, epochs):
 
 def main():
     parser = argparse.ArgumentParser(description='AAnet training script')
-    parser.add_argument('--dataset', required=True, choices=['mnist', 'blood', 'paul15'],
+    parser.add_argument('--dataset', required=True,
+                        choices=['mnist', 'blood', 'paul15', 'neurips2021'],
                         help='Dataset to train on')
     parser.add_argument('--subset', type=float, default=None,
                         help='Fraction of per-class data to use.')
@@ -216,9 +265,10 @@ def main():
     args = parser.parse_args()
 
     defaults = {
-        'mnist':  {'subset': 0.1},
-        'blood':  {'subset': 0.4},
-        'paul15': {'subset': 1.0},
+        'mnist':       {'subset': 0.1},
+        'blood':       {'subset': 0.4},
+        'paul15':      {'subset': 1.0},
+        'neurips2021': {'subset': 1.0},
     }
     if args.subset is None:
         args.subset = defaults[args.dataset]['subset']
@@ -231,6 +281,8 @@ def main():
     print(f'\n====  {args.dataset.upper()}  (subset={args.subset}) ====')
     if args.dataset == 'paul15':
         X_train, X_val, _, y, label_names, gene_names = load_paul15(args.subset)
+    elif args.dataset == 'neurips2021':
+        X_train, X_val, _, y, label_names, gene_names = load_neurips2021(args.subset)
     else:
         loaders = {'mnist': load_mnist, 'blood': load_blood}
         X_train, X_val, _, y = loaders[args.dataset](args.subset)

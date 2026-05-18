@@ -5,15 +5,16 @@ Usage:
     python analyze_linear_aa.py --dataset mnist
     python analyze_linear_aa.py --dataset blood --k_star 8
     python analyze_linear_aa.py --dataset paul15 --k_star 10
+    python analyze_linear_aa.py --dataset neurips2021 --k_star 10
 
 Generates and saves:
   1. Loss & NMI stability curves vs number of archetypes
-  2a. [mnist/blood] Archetype image grids
-  2b. [paul15]      Archetype gene expression heatmap
+  2a. [mnist/blood]           Archetype image grids
+  2b. [paul15/neurips2021]    Archetype feature expression heatmap
   3. Latent-space UMAP of S with archetype corners marked
   4. Consistency & ISI heatmaps
   5. [mnist/blood] Original vs reconstruction image grid
-  6. [paul15]      Archetype mixing weight distributions per cell type
+  6. [paul15/neurips2021]     Archetype mixing weight distributions per cell type
 """
 
 import argparse
@@ -40,9 +41,10 @@ except ImportError:
     HAS_SEABORN = False
     print('seaborn not found — mixing weight violin plots will be skipped.')
 
-CMAP  = {'mnist': 'gray_r', 'blood': None,   'paul15': None}
-SHAPE = {'mnist': (28, 28),  'blood': (28, 28, 3), 'paul15': None}
-LABEL = {'mnist': 'MNIST',   'blood': 'BloodMNIST', 'paul15': 'Paul et al. 2015'}
+CMAP  = {'mnist': 'gray_r', 'blood': None, 'paul15': None, 'neurips2021': None}
+SHAPE = {'mnist': (28, 28), 'blood': (28, 28, 3), 'paul15': None, 'neurips2021': None}
+LABEL = {'mnist': 'MNIST',  'blood': 'BloodMNIST', 'paul15': 'Paul et al. 2015',
+         'neurips2021': 'NeurIPS 2021 BMMC'}
 
 
 def reload_X(ds, subset):
@@ -73,7 +75,8 @@ def reload_X(ds, subset):
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze Linear AA results')
-    parser.add_argument('--dataset', required=True, choices=['mnist', 'blood', 'paul15'])
+    parser.add_argument('--dataset', required=True,
+                        choices=['mnist', 'blood', 'paul15', 'neurips2021'])
     parser.add_argument('--k_star', type=int, default=None,
                         help='Override k* for plots. Default: use n_arc_consistency from results.')
     parser.add_argument('--results_path', default=None,
@@ -141,11 +144,11 @@ def main():
     XC = np.array(result['archetype_list'][0])  # (features, k)
     k  = XC.shape[1]
 
-    if ds == 'paul15':
-        decoded   = XC.T          # (k, n_genes), already in [0,1]
-        top_n     = 30
-        top_idx   = np.argsort(decoded.var(axis=0))[-top_n:]
-        heatmap   = decoded[:, top_idx]
+    if ds in ('paul15', 'neurips2021'):
+        decoded    = XC.T          # (k, n_genes), already in [0,1]
+        top_n      = 30
+        top_idx    = np.argsort(decoded.var(axis=0))[-top_n:]
+        heatmap    = decoded[:, top_idx]
         gene_names = result.get('gene_names', [f'G{i}' for i in top_idx])
         col_labels = [gene_names[i] for i in top_idx]
 
@@ -216,7 +219,7 @@ def main():
     fig.suptitle(f'Linear AA — {label} — Latent Space ({method})',
                  fontsize=13, fontweight='bold')
 
-    if ds == 'paul15':
+    if ds in ('paul15', 'neurips2021'):
         all_label_names = result.get('label_names', labels.astype(str))
         label_names_train = (all_label_names[result['train_idx']]
                              if 'train_idx' in result else all_label_names)
@@ -283,7 +286,7 @@ def main():
     # 5. [mnist / blood] Original vs reconstruction grid
     # -------------------------------------------------------------------------
 
-    if ds != 'paul15':
+    if ds not in ('paul15', 'neurips2021'):
         k_recon = result['n_arc_consistency']
         k_idx_r = result['n_arc_list'].index(k_recon)
         XC_r    = np.array(result['archetype_list'][0])         # (features, k)
@@ -332,7 +335,7 @@ def main():
     # 6. [paul15] Archetype mixing weight distributions per cell type
     # -------------------------------------------------------------------------
 
-    if ds == 'paul15':
+    if ds in ('paul15', 'neurips2021'):
         if not HAS_SEABORN:
             print('Skipping mixing weight plot — seaborn not installed.')
         else:

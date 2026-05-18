@@ -5,15 +5,16 @@ Usage:
     python analyze_midaa.py --dataset mnist
     python analyze_midaa.py --dataset blood --k_star 8
     python analyze_midaa.py --dataset paul15 --k_star 10
+    python analyze_midaa.py --dataset neurips2021 --k_star 10
 
 Generates and saves:
   1. ELBO & NMI stability curves vs number of archetypes
-  2a. [mnist/blood] Archetype image grids (decoded through MLP decoder)
-  2b. [paul15]      Archetype gene expression heatmap
+  2a. [mnist/blood]           Archetype image grids (decoded through MLP decoder)
+  2b. [paul15/neurips2021]    Archetype feature expression heatmap
   3. Latent-space UMAP / PCA of Z (per-sample barycentric coordinates)
   4. Consistency & ISI heatmaps
   5. [mnist/blood] Original vs reconstruction image grid
-  6. [paul15]      Archetype mixing weight distributions per cell type
+  6. [paul15/neurips2021]     Archetype mixing weight distributions per cell type
 """
 
 import argparse
@@ -41,9 +42,10 @@ except ImportError:
     HAS_SEABORN = False
     print('seaborn not found — mixing weight violin plots will be skipped.')
 
-CMAP  = {'mnist': 'gray_r', 'blood': None,   'paul15': None}
-SHAPE = {'mnist': (28, 28),  'blood': (28, 28, 3), 'paul15': None}
-LABEL = {'mnist': 'MNIST',   'blood': 'BloodMNIST', 'paul15': 'Paul et al. 2015'}
+CMAP  = {'mnist': 'gray_r', 'blood': None, 'paul15': None, 'neurips2021': None}
+SHAPE = {'mnist': (28, 28), 'blood': (28, 28, 3), 'paul15': None, 'neurips2021': None}
+LABEL = {'mnist': 'MNIST',  'blood': 'BloodMNIST', 'paul15': 'Paul et al. 2015',
+         'neurips2021': 'NeurIPS 2021 BMMC'}
 
 
 class MLPDecoder(nn.Module):
@@ -101,7 +103,8 @@ def _mixing_weights(Z):
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze MIDAA results')
-    parser.add_argument('--dataset', required=True, choices=['mnist', 'blood', 'paul15'])
+    parser.add_argument('--dataset', required=True,
+                        choices=['mnist', 'blood', 'paul15', 'neurips2021'])
     parser.add_argument('--k_star', type=int, default=None,
                         help='Override k* for plots. Default: use n_arc_consistency from results.')
     parser.add_argument('--results_path', default=None,
@@ -174,12 +177,11 @@ def main():
 
     k = decoded.shape[0]
 
-    if ds == 'paul15':
-        # Select top 30 genes with highest variance across archetypes (most discriminative)
-        top_n = 30
-        gene_var = decoded.var(axis=0)
-        top_idx  = np.argsort(gene_var)[-top_n:]
-        heatmap  = decoded[:, top_idx]           # (k, top_n)
+    if ds in ('paul15', 'neurips2021'):
+        top_n      = 30
+        gene_var   = decoded.var(axis=0)
+        top_idx    = np.argsort(gene_var)[-top_n:]
+        heatmap    = decoded[:, top_idx]           # (k, top_n)
         gene_names = result.get('gene_names', [f'G{i}' for i in top_idx])
         col_labels = [gene_names[i] for i in top_idx]
 
@@ -251,7 +253,7 @@ def main():
     fig, ax = plt.subplots(figsize=(8, 6))
     fig.suptitle(f'MIDAA — {label} — Latent Space ({method})', fontsize=13, fontweight='bold')
 
-    if ds == 'paul15':
+    if ds in ('paul15', 'neurips2021'):
         label_names = result.get('label_names', labels.astype(str))
         unique_ct   = sorted(set(label_names))
         colors      = plt.get_cmap(cmap_name)(np.linspace(0, 1, len(unique_ct)))
@@ -315,7 +317,7 @@ def main():
     # 5. [mnist / blood] Original vs reconstruction image grid
     # -------------------------------------------------------------------------
 
-    if ds != 'paul15':
+    if ds not in ('paul15', 'neurips2021'):
         decoder   = rebuild_decoder(result)
         X, y_orig = reload_X(ds, subset)
         Z         = np.array(result['Z'])
@@ -363,7 +365,7 @@ def main():
     # 6. [paul15] Archetype mixing weight distributions per cell type
     # -------------------------------------------------------------------------
 
-    if ds == 'paul15':
+    if ds in ('paul15', 'neurips2021'):
         if not HAS_SEABORN:
             print('Skipping mixing weight plot — seaborn not installed.')
         else:

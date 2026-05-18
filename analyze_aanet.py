@@ -5,15 +5,16 @@ Usage:
     python analyze_aanet.py --dataset mnist
     python analyze_aanet.py --dataset blood --k_star 8
     python analyze_aanet.py --dataset paul15
+    python analyze_aanet.py --dataset neurips2021
 
 Generates and saves:
   1. Reconstruction loss vs k and final-epoch NMI vs k
-  2a. [mnist/blood] Archetype image grids
-  2b. [paul15]      Archetype gene expression heatmap
+  2a. [mnist/blood]           Archetype image grids
+  2b. [paul15/neurips2021]    Archetype feature expression heatmap
   3. Latent-space UMAP / PCA of encoder outputs with archetype corners
   4. Consistency & ISI heatmaps
   5. [mnist/blood] Original vs reconstruction image grid
-  6. [paul15]      Archetype mixing weight distributions per cell type
+  6. [paul15/neurips2021]     Archetype mixing weight distributions per cell type
 """
 
 import argparse
@@ -40,9 +41,10 @@ except ImportError:
     HAS_SEABORN = False
     print('seaborn not found — mixing weight violin plots will be skipped.')
 
-CMAP  = {'mnist': 'gray_r', 'blood': None,   'paul15': None}
-SHAPE = {'mnist': (28, 28),  'blood': (28, 28, 3), 'paul15': None}
-LABEL = {'mnist': 'MNIST',   'blood': 'BloodMNIST', 'paul15': 'Paul et al. 2015'}
+CMAP  = {'mnist': 'gray_r', 'blood': None, 'paul15': None, 'neurips2021': None}
+SHAPE = {'mnist': (28, 28), 'blood': (28, 28, 3), 'paul15': None, 'neurips2021': None}
+LABEL = {'mnist': 'MNIST',  'blood': 'BloodMNIST', 'paul15': 'Paul et al. 2015',
+         'neurips2021': 'NeurIPS 2021 BMMC'}
 
 
 def reload_data(ds, subset):
@@ -97,6 +99,30 @@ def reload_paul15(subset):
     return X[idx], y[idx], labels_raw[idx]
 
 
+def reload_neurips2021(subset):
+    """Return (N, n_hvg) float32 in [-1,1], int labels, and string cell-type labels."""
+    import scanpy as sc
+    import scipy.sparse as sp
+    fn = './data/GSE194122_openproblems_neurips2021_multiome_BMMC_processed.h5ad'
+    adata_full = sc.read(fn)
+    n_obs = max(100, int(subset * 10000))
+    adata = sc.pp.subsample(adata_full, n_obs=n_obs, copy=True, random_state=42)
+    labels_raw = adata.obs['cell_type'].astype(str).values
+    unique_labels = sorted(set(labels_raw))
+    label_map = {l: i for i, l in enumerate(unique_labels)}
+    y = np.array([label_map[l] for l in labels_raw], dtype=int)
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+    sc.pp.highly_variable_genes(adata, n_top_genes=2000)
+    adata = adata[:, adata.var['highly_variable']].copy()
+    X = adata.X.toarray() if sp.issparse(adata.X) else np.array(adata.X)
+    X = X.astype(np.float32)
+    X_min, X_max = X.min(axis=0), X.max(axis=0)
+    X = (X - X_min) / np.where(X_max - X_min > 0, X_max - X_min, 1.0)
+    X = X * 2 - 1  # [0,1] → [-1,1]
+    return X, y, labels_raw
+
+
 def rebuild_model(result):
     from aanetOrig import AAnet_vanilla
     model = AAnet_vanilla(
@@ -110,7 +136,8 @@ def rebuild_model(result):
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze AAnet results')
-    parser.add_argument('--dataset', required=True, choices=['mnist', 'blood', 'paul15'])
+    parser.add_argument('--dataset', required=True,
+                        choices=['mnist', 'blood', 'paul15', 'neurips2021'])
     parser.add_argument('--k_star', type=int, default=None,
                         help='Override k* for plots. Default: use best_k from results.')
     parser.add_argument('--results_path', default=None,
@@ -171,13 +198,13 @@ def main():
     XC = np.array(result['archetype_list'][0])   # (features, k) in [-1,1] space
     k  = XC.shape[1]
 
-    if ds == 'paul15':
+    if ds in ('paul15', 'neurips2021'):
         decoded_01 = (XC.T + 1) / 2              # (k, n_genes), back to [0,1]
         top_n      = 30
         top_idx    = np.argsort(decoded_01.var(axis=0))[-top_n:]
         heatmap    = decoded_01[:, top_idx]
-        gene_names  = result.get('gene_names', [f'G{i}' for i in top_idx])
-        col_labels  = [gene_names[i] for i in top_idx]
+        gene_names = result.get('gene_names', [f'G{i}' for i in top_idx])
+        col_labels = [gene_names[i] for i in top_idx]
 
         fig, ax = plt.subplots(figsize=(max(12, top_n * 0.35), max(4, 0.45 * k + 1.5)))
         fig.suptitle(f'{label} — Archetype Gene Expression (top {top_n} discriminative genes)',
@@ -222,6 +249,8 @@ def main():
 
     if ds == 'paul15':
         X_data, labels, label_names_str = reload_paul15(subset)
+    elif ds == 'neurips2021':
+        X_data, labels, label_names_str = reload_neurips2021(subset)
     else:
         X_data, labels = reload_data(ds, subset)
         label_names_str = labels.astype(str)
@@ -253,7 +282,7 @@ def main():
     fig.suptitle(f'AAnet — {label} — Latent Space ({method})',
                  fontsize=13, fontweight='bold')
 
-    if ds == 'paul15':
+    if ds in ('paul15', 'neurips2021'):
         unique_ct = sorted(set(label_names_str))
         colors    = plt.get_cmap('tab20')(np.linspace(0, 1, len(unique_ct)))
         ct_to_col = {ct: colors[i] for i, ct in enumerate(unique_ct)}
@@ -317,7 +346,7 @@ def main():
     # 5. [mnist / blood] Original vs reconstruction image grid
     # -------------------------------------------------------------------------
 
-    if ds != 'paul15':
+    if ds not in ('paul15', 'neurips2021'):
         model     = rebuild_model(result)
         X_img, y_orig = reload_data(ds, subset)
         X_t       = torch.tensor(X_img)
@@ -361,13 +390,16 @@ def main():
     # 6. [paul15] Archetype mixing weight distributions per cell type
     # -------------------------------------------------------------------------
 
-    if ds == 'paul15':
+    if ds in ('paul15', 'neurips2021'):
         if not HAS_SEABORN:
             print('Skipping mixing weight plot — seaborn not installed.')
         else:
             model_mw = rebuild_model(result)
-            X_paul15, _, label_names_mw = reload_paul15(subset)
-            X_t_mw = torch.tensor(X_paul15)
+            if ds == 'neurips2021':
+                X_sc, _, label_names_mw = reload_neurips2021(subset)
+            else:
+                X_sc, _, label_names_mw = reload_paul15(subset)
+            X_t_mw = torch.tensor(X_sc)
             with torch.no_grad():
                 z_mw    = model_mw.encode(X_t_mw)
                 weights = torch.softmax(z_mw, dim=1).numpy()   # (N, k)

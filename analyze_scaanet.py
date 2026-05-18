@@ -5,15 +5,16 @@ Usage:
     python analyze_scaanet.py --dataset mnist
     python analyze_scaanet.py --dataset blood --k_star 8
     python analyze_scaanet.py --dataset paul15
+    python analyze_scaanet.py --dataset neurips2021
 
 Generates and saves:
   1. Reconstruction loss & NMI stability curves vs K
-  2a. [mnist/blood] Archetype image grids (decoded spectra, normalised to [0-1])
-  2b. [paul15]      Archetype gene expression heatmap
+  2a. [mnist/blood]           Archetype image grids (decoded spectra, normalised to [0-1])
+  2b. [paul15/neurips2021]    Archetype feature expression heatmap
   3. Latent-space UMAP / PCA of per-cell usage weights
   4. Consistency & ISI heatmaps
   5. [mnist/blood] Original vs reconstruction image grid
-  6. [paul15]      Archetype mixing weight distributions per cell type
+  6. [paul15/neurips2021]     Archetype mixing weight distributions per cell type
 """
 
 import argparse
@@ -40,9 +41,10 @@ except ImportError:
     HAS_SEABORN = False
     print('seaborn not found — mixing weight violin plots will be skipped.')
 
-CMAP  = {'mnist': 'gray_r', 'blood': None,   'paul15': None}
-SHAPE = {'mnist': (28, 28),  'blood': (28, 28, 3), 'paul15': None}
-LABEL = {'mnist': 'MNIST',   'blood': 'BloodMNIST', 'paul15': 'Paul et al. 2015'}
+CMAP  = {'mnist': 'gray_r', 'blood': None, 'paul15': None, 'neurips2021': None}
+SHAPE = {'mnist': (28, 28), 'blood': (28, 28, 3), 'paul15': None, 'neurips2021': None}
+LABEL = {'mnist': 'MNIST',  'blood': 'BloodMNIST', 'paul15': 'Paul et al. 2015',
+         'neurips2021': 'NeurIPS 2021 BMMC'}
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +79,7 @@ def reload_X(ds, subset):
 def main():
     parser = argparse.ArgumentParser(description='Analyze scAAnet results')
     parser.add_argument('--dataset', required=True,
-                        choices=['mnist', 'blood', 'paul15'])
+                        choices=['mnist', 'blood', 'paul15', 'neurips2021'])
     parser.add_argument('--k_star', type=int, default=None,
                         help='Override K* for plots. Default: K_consistency from results.')
     parser.add_argument('--results_path', default=None,
@@ -148,8 +150,8 @@ def main():
     XC = np.array(result['archetype_list'][0])   # (G, K)
     k  = XC.shape[1]
 
-    if ds == 'paul15':
-        decoded_01 = XC.T.copy()    # (K, G) raw count scale
+    if ds in ('paul15', 'neurips2021'):
+        decoded_01 = XC.T.copy()    # (K, G) raw count / pseudo-count scale
         # row-wise min-max to [0,1] for visual comparability
         row_min = decoded_01.min(axis=1, keepdims=True)
         row_max = decoded_01.max(axis=1, keepdims=True)
@@ -229,7 +231,7 @@ def main():
     fig.suptitle(f'scAAnet — {label} — Latent Space ({method})',
                  fontsize=13, fontweight='bold')
 
-    if ds == 'paul15':
+    if ds in ('paul15', 'neurips2021'):
         label_names = result.get('label_names', labels.astype(str))
         unique_ct   = sorted(set(label_names))
         colors      = plt.get_cmap('tab20')(np.linspace(0, 1, len(unique_ct)))
@@ -295,7 +297,7 @@ def main():
     # final_recon is (N, G) in raw count scale; divide by 255 to display
     # -------------------------------------------------------------------------
 
-    if ds != 'paul15':
+    if ds not in ('paul15', 'neurips2021'):
         X_orig, y_orig = reload_X(ds, subset)
         recon          = np.array(result['final_recon'])   # (N, G) raw counts
         classes        = np.unique(y_orig)
@@ -338,7 +340,7 @@ def main():
     # usage_list[0] is (N, K) — directly the simplex mixing weights; no softmax needed
     # -------------------------------------------------------------------------
 
-    if ds == 'paul15':
+    if ds in ('paul15', 'neurips2021'):
         if not HAS_SEABORN:
             print('Skipping mixing weight plot — seaborn not installed.')
         else:

@@ -4,12 +4,14 @@ scAAnet (Single-cell Archetypal Analysis Network) training script.
 scAAnet uses a count-distribution autoencoder (ZINB / NB / Poisson) to
 discover archetypes in high-dimensional count data.
 
-  paul15 → ae_type='zinb'  (zero-inflated NB; raw scRNA-seq counts)
-  mnist  → ae_type='nb'    (NB; raw pixel values [0-255] treated as counts)
-  blood  → ae_type='nb'    (same)
+  paul15      → ae_type='zinb'  (zero-inflated NB; raw scRNA-seq counts)
+  neurips2021 → ae_type='zinb'  (zero-inflated NB; raw scRNA-seq counts for 2000 HVGs)
+  mnist       → ae_type='nb'    (NB; raw pixel values [0-255] treated as counts)
+  blood       → ae_type='nb'    (same)
 
 Usage:
     python scAAnet.py --dataset paul15
+    python scAAnet.py --dataset neurips2021
     python scAAnet.py --dataset mnist  --K_consistency 10
     python scAAnet.py --dataset blood  --K_consistency 8
 
@@ -18,6 +20,8 @@ Saves: results/scaanet_{dataset}_results.pt
 Dependencies:
     pip install scAAnet scanpy anndata
     (see requirements_scaanet.txt for the full list)
+    For neurips2021: place GSE194122_openproblems_neurips2021_multiome_BMMC_processed.h5ad
+    in ./data/ or install kagglehub for automatic download.
 
 Note: scAAnet requires TensorFlow 2, which is incompatible with Python 3.12+.
 Use a dedicated Python 3.10 / 3.11 environment for this script.
@@ -60,6 +64,48 @@ def load_blood(subset):
                                 max(1, int(subset * np.sum(y == d))), replace=False)
                      for d in np.unique(y)])
     return X[idx].astype(np.float32), y[idx], y[idx].astype(str), None
+
+
+def load_neurips2021(subset):
+    import scanpy as sc
+    import scipy.sparse as sp
+    fn = './data/GSE194122_openproblems_neurips2021_multiome_BMMC_processed.h5ad'
+    if not os.path.exists(fn):
+        try:
+            import kagglehub
+            import glob as _glob
+            path = kagglehub.dataset_download(
+                'alexandervc/scrnaseq-scatacseq-challenge-at-neurips-2021',
+                force_download=False)
+            candidates = _glob.glob(os.path.join(path, '**', '*.h5ad'), recursive=True)
+            if candidates:
+                fn = candidates[0]
+        except Exception:
+            raise FileNotFoundError(
+                f'NeurIPS 2021 h5ad not found at {fn!r}. '
+                'Place the file at ./data/ or install kagglehub for automatic download.')
+    adata_full = sc.read(fn)
+    n_obs = max(100, int(subset * 10000))
+    adata = sc.pp.subsample(adata_full, n_obs=n_obs, copy=True, random_state=42)
+
+    labels_raw = adata.obs['cell_type'].astype(str).values
+    unique_labels = sorted(set(labels_raw))
+    label_map = {l: i for i, l in enumerate(unique_labels)}
+    y = np.array([label_map[l] for l in labels_raw], dtype=int)
+
+    # Select HVGs on normalized copy, extract raw counts for those genes (same as paul15)
+    adata_norm = adata.copy()
+    sc.pp.normalize_total(adata_norm, target_sum=1e4)
+    sc.pp.log1p(adata_norm)
+    sc.pp.highly_variable_genes(adata_norm, n_top_genes=2000)
+    hvg_mask = adata_norm.var['highly_variable'].values
+    gene_names = adata.var_names[hvg_mask].tolist()
+
+    X_raw = adata.X
+    if sp.issparse(X_raw):
+        X_raw = X_raw.toarray()
+    X = np.array(X_raw, dtype=np.float32)[:, hvg_mask]
+    return X, y, labels_raw, gene_names
 
 
 def load_paul15(subset):
@@ -180,7 +226,7 @@ def run_sweep(X, ae_type, K_list, n_runs, K_consistency, R,
 def main():
     parser = argparse.ArgumentParser(description='scAAnet training script')
     parser.add_argument('--dataset', required=True,
-                        choices=['mnist', 'blood', 'paul15'])
+                        choices=['mnist', 'blood', 'paul15', 'neurips2021'])
     parser.add_argument('--subset', type=float, default=None,
                         help='Fraction of per-class data. Default: 0.1 (mnist/blood), 1.0 (paul15)')
     parser.add_argument('--K_min', type=int, default=4)
@@ -201,9 +247,10 @@ def main():
     args = parser.parse_args()
 
     defaults = {
-        'mnist':  {'subset': 0.1, 'K_consistency': 10, 'ae_type': 'nb'},
-        'blood':  {'subset': 0.4, 'K_consistency': 8,  'ae_type': 'nb'},
-        'paul15': {'subset': 1.0, 'K_consistency': 10, 'ae_type': 'zinb'},
+        'mnist':       {'subset': 0.1, 'K_consistency': 10, 'ae_type': 'nb'},
+        'blood':       {'subset': 0.4, 'K_consistency': 8,  'ae_type': 'nb'},
+        'paul15':      {'subset': 1.0, 'K_consistency': 10, 'ae_type': 'zinb'},
+        'neurips2021': {'subset': 1.0, 'K_consistency': 10, 'ae_type': 'zinb'},
     }
     if args.subset is None:
         args.subset = defaults[args.dataset]['subset']
@@ -218,10 +265,20 @@ def main():
     print(f'\n====  {args.dataset.upper()}  '
           f'(subset={args.subset}, ae_type={args.ae_type}) ====')
 
-    loaders = {'mnist': load_mnist, 'blood': load_blood, 'paul15': load_paul15}
+    loaders = {
+        'mnist':       load_mnist,
+        'blood':       load_blood,
+        'paul15':      load_paul15,
+        'neurips2021': load_neurips2021,
+    }
     X, y, label_names, gene_names = loaders[args.dataset](args.subset)
 
-    names = {'mnist': 'MNIST', 'blood': 'Blood', 'paul15': 'Paul15'}
+    names = {
+        'mnist':       'MNIST',
+        'blood':       'Blood',
+        'paul15':      'Paul15',
+        'neurips2021': 'NeurIPS 2021',
+    }
     result = run_sweep(X, args.ae_type, K_list, args.n_runs, args.K_consistency,
                        args.R, args.epochs, args.batch_size, args.lr,
                        names[args.dataset])
