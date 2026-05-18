@@ -16,6 +16,32 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 # Data loading
 # ---------------------------------------------------------------------------
 
+def load_paul15(subset):
+    import scanpy as sc
+    import scipy.sparse as sp
+    adata = sc.datasets.paul15()
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+    sc.pp.highly_variable_genes(adata, n_top_genes=1000)
+    adata = adata[:, adata.var['highly_variable']].copy()
+    X = adata.X.toarray() if sp.issparse(adata.X) else np.array(adata.X)
+    X = X.astype(np.float64)
+    X_min, X_max = X.min(axis=0), X.max(axis=0)
+    X = (X - X_min) / np.where(X_max - X_min > 0, X_max - X_min, 1.0)
+    gene_names = adata.var_names.tolist()
+    labels_raw = adata.obs['paul15_clusters'].astype(str).values
+    unique_labels = sorted(set(labels_raw))
+    label_map = {l: i for i, l in enumerate(unique_labels)}
+    y = np.array([label_map[l] for l in labels_raw], dtype=int)
+    rng = np.random.default_rng(42)
+    idx = (np.hstack([rng.choice(np.where(y == d)[0],
+                                  max(1, int(subset * np.sum(y == d))), replace=False)
+                      for d in np.unique(y)])
+           if subset < 1.0 else np.arange(len(y)))
+    X_v1 = torch.from_numpy(X[idx].T)   # (features, N), double
+    return X_v1, y[idx], labels_raw[idx], gene_names
+
+
 def load_mnist(subset):
     mnist = datasets.MNIST(root='./data', train=True, download=True,
                            transform=transforms.ToTensor())
@@ -146,10 +172,10 @@ def run_dataset(X, n_arc_list, n_runs, n_arc_consistency, R, name,
 
 def main():
     parser = argparse.ArgumentParser(description='Linear AA training script')
-    parser.add_argument('--dataset', required=True, choices=['mnist', 'blood'],
+    parser.add_argument('--dataset', required=True, choices=['mnist', 'blood', 'paul15'],
                         help='Dataset to train on')
     parser.add_argument('--subset', type=float, default=None,
-                        help='Fraction of per-class data to use. Default: 0.02')
+                        help='Fraction of per-class data to use.')
     parser.add_argument('--n_arc_min', type=int, default=2)
     parser.add_argument('--n_arc_max', type=int, default=20)
     parser.add_argument('--n_runs', type=int, default=4,
@@ -163,24 +189,38 @@ def main():
     parser.add_argument('--outdir', default='results')
     args = parser.parse_args()
 
+    defaults = {
+        'mnist':  {'subset': 0.1, 'n_arc_consistency': 10},
+        'blood':  {'subset': 0.4, 'n_arc_consistency': 8},
+        'paul15': {'subset': 1.0, 'n_arc_consistency': 10},
+    }
     if args.subset is None:
-        args.subset = 0.1
+        args.subset = defaults[args.dataset]['subset']
     if args.n_arc_consistency is None:
-        args.n_arc_consistency = 8 if args.dataset == 'blood' else 10
+        args.n_arc_consistency = defaults[args.dataset]['n_arc_consistency']
 
     os.makedirs(args.outdir, exist_ok=True)
     n_arc_list = list(range(args.n_arc_min, args.n_arc_max))
 
     print(f'\n====  {args.dataset.upper()}  (subset={args.subset}) ====')
-    loader_fn = load_mnist if args.dataset == 'mnist' else load_blood
-    X, y = loader_fn(args.subset)
+    if args.dataset == 'paul15':
+        X, y, label_names, gene_names = load_paul15(args.subset)
+        name = 'Paul15'
+    else:
+        loaders = {'mnist': load_mnist, 'blood': load_blood}
+        X, y = loaders[args.dataset](args.subset)
+        label_names = y.astype(str)
+        gene_names  = None
+        name = 'MNIST' if args.dataset == 'mnist' else 'Blood'
 
-    name = 'MNIST' if args.dataset == 'mnist' else 'Blood'
     result = run_dataset(X, n_arc_list, args.n_runs, args.n_arc_consistency,
                          args.R, name, val_fraction=args.val_fraction)
-    result['labels']  = y
-    result['subset']  = args.subset
-    result['dataset'] = args.dataset
+    result['labels']      = y
+    result['label_names'] = label_names
+    result['subset']      = args.subset
+    result['dataset']     = args.dataset
+    if gene_names is not None:
+        result['gene_names'] = gene_names
 
     out_path = os.path.join(args.outdir, f'linear_aa_{args.dataset}_results.pt')
     torch.save(result, out_path)

@@ -25,6 +25,38 @@ from utils import ArchetypeConsistency, preprocess
 # Data loading
 # ---------------------------------------------------------------------------
 
+def load_paul15(subset):
+    import scanpy as sc
+    import scipy.sparse as sp
+    adata = sc.datasets.paul15()
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+    sc.pp.highly_variable_genes(adata, n_top_genes=1000)
+    adata = adata[:, adata.var['highly_variable']].copy()
+    X = adata.X.toarray() if sp.issparse(adata.X) else np.array(adata.X)
+    X = X.astype(np.float32)
+    X_min, X_max = X.min(axis=0), X.max(axis=0)
+    X = (X - X_min) / np.where(X_max - X_min > 0, X_max - X_min, 1.0)
+    X = X * 2 - 1  # [0,1] → [-1,1]
+    gene_names = adata.var_names.tolist()
+    labels_raw = adata.obs['paul15_clusters'].astype(str).values
+    unique_labels = sorted(set(labels_raw))
+    label_map = {l: i for i, l in enumerate(unique_labels)}
+    y = np.array([label_map[l] for l in labels_raw], dtype=int)
+    rng = np.random.default_rng(42)
+    idx = (np.hstack([rng.choice(np.where(y == d)[0],
+                                  max(1, int(subset * np.sum(y == d))), replace=False)
+                      for d in np.unique(y)])
+           if subset < 1.0 else np.arange(len(y)))
+    data = torch.from_numpy(X[idx]).float()
+    N = len(data)
+    perm = torch.randperm(N)
+    t, v = int(0.7 * N), int(0.85 * N)
+    perm_np = perm.numpy()
+    return (data[perm[:t]], data[perm[t:v]], data[perm[v:]],
+            y[idx][perm_np], labels_raw[idx][perm_np], gene_names)
+
+
 def load_mnist(subset):
     from torchvision import datasets, transforms
     mnist = datasets.MNIST(root='./data', train=True, download=True,
@@ -129,7 +161,7 @@ def repeated_runs(X_all, input_shape, device, best_k, R, epochs):
 
     archetype_list, NMI_list, state_dicts = [], [], []
 
-    for r in tqdm(range(R), desc=f'Consistency runs (k={best_k})'):
+    for _ in tqdm(range(R), desc=f'Consistency runs (k={best_k})'):
         lap_ext = get_laplacian_extrema(X_all.numpy(), n_extrema=best_k)
         model = AAnet_vanilla(
             noise=0.05, layer_widths=[256, 128], n_archetypes=best_k,
@@ -170,10 +202,10 @@ def repeated_runs(X_all, input_shape, device, best_k, R, epochs):
 
 def main():
     parser = argparse.ArgumentParser(description='AAnet training script')
-    parser.add_argument('--dataset', required=True, choices=['mnist', 'blood'],
+    parser.add_argument('--dataset', required=True, choices=['mnist', 'blood', 'paul15'],
                         help='Dataset to train on')
     parser.add_argument('--subset', type=float, default=None,
-                        help='Fraction of per-class data to use. Default: 1.0')
+                        help='Fraction of per-class data to use.')
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--n_arc_min', type=int, default=2)
@@ -183,8 +215,13 @@ def main():
     parser.add_argument('--outdir', default='results')
     args = parser.parse_args()
 
+    defaults = {
+        'mnist':  {'subset': 0.1},
+        'blood':  {'subset': 0.4},
+        'paul15': {'subset': 1.0},
+    }
     if args.subset is None:
-        args.subset = 0.1
+        args.subset = defaults[args.dataset]['subset']
 
     os.makedirs(args.outdir, exist_ok=True)
     device = torch.device(args.device)
@@ -192,8 +229,13 @@ def main():
     n_arc_range = (args.n_arc_min, args.n_arc_max)
 
     print(f'\n====  {args.dataset.upper()}  (subset={args.subset}) ====')
-    loader_fn = load_mnist if args.dataset == 'mnist' else load_blood
-    X_train, X_val, X_test, y = loader_fn(args.subset)
+    if args.dataset == 'paul15':
+        X_train, X_val, _, y, label_names, gene_names = load_paul15(args.subset)
+    else:
+        loaders = {'mnist': load_mnist, 'blood': load_blood}
+        X_train, X_val, _, y = loaders[args.dataset](args.subset)
+        label_names = y.astype(str)
+        gene_names  = None
     input_shape = X_train.shape[1]
 
     print('Sweeping archetype counts...')
@@ -218,9 +260,12 @@ def main():
         'input_shape':           input_shape,
         'layer_widths':          [256, 128],
         'labels':                y,
+        'label_names':           label_names,
         'subset':                args.subset,
         'dataset':               args.dataset,
     }
+    if gene_names is not None:
+        result['gene_names'] = gene_names
 
     out_path = os.path.join(args.outdir, f'aanet_{args.dataset}_results.pt')
     torch.save(result, out_path)

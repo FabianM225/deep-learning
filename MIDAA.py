@@ -4,6 +4,7 @@ MIDAA (Multimodal Archetypal Analysis) training script.
 Usage:
     python MIDAA.py --dataset mnist
     python MIDAA.py --dataset blood --subset 0.4 --steps 1500
+    python MIDAA.py --dataset paul15 --steps 1500
 
 Saves: results/midaa_{dataset}_results.pt
 
@@ -33,13 +34,14 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 # ---------------------------------------------------------------------------
 
 class MLPDecoder(nn.Module):
-    """General image decoder — Sigmoid output, works for any flat image size."""
-    def __init__(self, latent_dim, output_dim):
+    """General decoder — output_activation defaults to Sigmoid for image data."""
+    def __init__(self, latent_dim, output_dim, output_activation=None):
         super().__init__()
+        activation = output_activation if output_activation is not None else nn.Sigmoid()
         self.net = nn.Sequential(
             nn.Linear(latent_dim, 256), nn.ReLU(),
             nn.Linear(256, 512),        nn.ReLU(),
-            nn.Linear(512, output_dim), nn.Sigmoid(),
+            nn.Linear(512, output_dim), activation,
         )
 
     def forward(self, z):
@@ -80,6 +82,40 @@ def load_blood(subset):
     adata = ad.AnnData(X_sub)
     adata.obs['label'] = y_sub.astype(str)
     return adata, y_sub
+
+
+def load_paul15(subset):
+    import scanpy as sc
+    adata = sc.datasets.paul15()
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+    sc.pp.highly_variable_genes(adata, n_top_genes=1000)
+    adata = adata[:, adata.var['highly_variable']].copy()
+
+    # Min-max scale to [0, 1] so the Sigmoid decoder can be reused
+    X = adata.X if not hasattr(adata.X, 'toarray') else adata.X.toarray()
+    X = X.astype(np.float32)
+    X_min, X_max = X.min(axis=0), X.max(axis=0)
+    denom = np.where(X_max - X_min > 0, X_max - X_min, 1.0)
+    X = (X - X_min) / denom
+
+    labels_raw = adata.obs['paul15_clusters'].astype(str).values
+    unique_labels = sorted(set(labels_raw))
+    label_map = {l: i for i, l in enumerate(unique_labels)}
+    y = np.array([label_map[l] for l in labels_raw], dtype=int)
+
+    rng = np.random.default_rng(42)
+    if subset < 1.0:
+        idx = np.hstack([rng.choice(np.where(y == d)[0],
+                                    max(1, int(subset * np.sum(y == d))), replace=False)
+                         for d in np.unique(y)])
+    else:
+        idx = np.arange(len(y))
+
+    adata_sub = ad.AnnData(X[idx])
+    adata_sub.obs['label'] = labels_raw[idx]
+    adata_sub.uns['gene_names'] = adata.var_names.tolist()
+    return adata_sub, y[idx]
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +259,7 @@ def run_sweep(X_dense, name, output_dim, n_arc_list, n_runs, n_arc_consistency,
 
 def main():
     parser = argparse.ArgumentParser(description='MIDAA training script')
-    parser.add_argument('--dataset', required=True, choices=['mnist', 'blood'],
+    parser.add_argument('--dataset', required=True, choices=['mnist', 'blood', 'paul15'],
                         help='Dataset to train on')
     parser.add_argument('--subset', type=float, default=None,
                         help='Fraction of per-class data. Default: 0.2 (mnist), 0.4 (blood)')
@@ -242,27 +278,40 @@ def main():
     parser.add_argument('--outdir', default='results')
     args = parser.parse_args()
 
+    defaults = {
+        'mnist':   {'subset': 0.1, 'n_arc_consistency': 10},
+        'blood':   {'subset': 0.4, 'n_arc_consistency': 8},
+        'paul15':  {'subset': 1.0, 'n_arc_consistency': 10},
+    }
     if args.subset is None:
-        args.subset = 0.1
+        args.subset = defaults[args.dataset]['subset']
     if args.n_arc_consistency is None:
-        args.n_arc_consistency = 8 if args.dataset == 'blood' else 10
+        args.n_arc_consistency = defaults[args.dataset]['n_arc_consistency']
 
     os.makedirs(args.outdir, exist_ok=True)
     print(f'Device: {DEVICE}' + (f'  ({torch.cuda.get_device_name(0)})' if DEVICE == 'cuda' else ''))
     n_arc_list = list(range(args.n_arc_min, args.n_arc_max))
 
     print(f'\n====  {args.dataset.upper()}  (subset={args.subset}) ====')
-    loader_fn = load_mnist if args.dataset == 'mnist' else load_blood
-    adata, y = loader_fn(args.subset)
+    loaders = {'mnist': load_mnist, 'blood': load_blood, 'paul15': load_paul15}
+    adata, y = loaders[args.dataset](args.subset)
 
-    name = 'MNIST' if args.dataset == 'mnist' else 'Blood'
-    output_dim = 784 if args.dataset == 'mnist' else 2352
+    dataset_meta = {
+        'mnist':  {'name': 'MNIST',   'output_dim': 784},
+        'blood':  {'name': 'Blood',   'output_dim': 2352},
+        'paul15': {'name': 'Paul15',  'output_dim': adata.X.shape[1]},
+    }
+    name = dataset_meta[args.dataset]['name']
+    output_dim = dataset_meta[args.dataset]['output_dim']
     result = run_sweep(adata.X, name, output_dim, n_arc_list, args.n_runs,
                        args.n_arc_consistency, args.R,
                        args.steps, args.lr_midaa, args.decoder_epochs)
-    result['labels']  = y
-    result['subset']  = args.subset
-    result['dataset'] = args.dataset
+    result['labels']      = y
+    result['label_names'] = adata.obs['label'].values
+    result['subset']      = args.subset
+    result['dataset']     = args.dataset
+    if 'gene_names' in getattr(adata, 'uns', {}):
+        result['gene_names'] = adata.uns['gene_names']
 
     out_path = os.path.join(args.outdir, f'midaa_{args.dataset}_results.pt')
     torch.save(result, out_path)

@@ -1,16 +1,16 @@
 """
-Analysis script for MIDAA results.
+Analysis script for scAAnet results.
 
 Usage:
-    python analyze_midaa.py --dataset mnist
-    python analyze_midaa.py --dataset blood --k_star 8
-    python analyze_midaa.py --dataset paul15 --k_star 10
+    python analyze_scaanet.py --dataset mnist
+    python analyze_scaanet.py --dataset blood --k_star 8
+    python analyze_scaanet.py --dataset paul15
 
 Generates and saves:
-  1. ELBO & NMI stability curves vs number of archetypes
-  2a. [mnist/blood] Archetype image grids (decoded through MLP decoder)
+  1. Reconstruction loss & NMI stability curves vs K
+  2a. [mnist/blood] Archetype image grids (decoded spectra, normalised to [0-1])
   2b. [paul15]      Archetype gene expression heatmap
-  3. Latent-space UMAP / PCA of Z (per-sample barycentric coordinates)
+  3. Latent-space UMAP / PCA of per-cell usage weights
   4. Consistency & ISI heatmaps
   5. [mnist/blood] Original vs reconstruction image grid
   6. [paul15]      Archetype mixing weight distributions per cell type
@@ -19,7 +19,6 @@ Generates and saves:
 import argparse
 import os
 import torch
-import torch.nn as nn
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -46,151 +45,128 @@ SHAPE = {'mnist': (28, 28),  'blood': (28, 28, 3), 'paul15': None}
 LABEL = {'mnist': 'MNIST',   'blood': 'BloodMNIST', 'paul15': 'Paul et al. 2015'}
 
 
-class MLPDecoder(nn.Module):
-    def __init__(self, latent_dim, output_dim, output_activation=None):
-        super().__init__()
-        activation = output_activation if output_activation is not None else nn.Sigmoid()
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim, 256), nn.ReLU(),
-            nn.Linear(256, 512),        nn.ReLU(),
-            nn.Linear(512, output_dim), activation,
-        )
-
-    def forward(self, z):
-        return self.net(z)
-
-
-def rebuild_decoder(result):
-    decoder = MLPDecoder(result['latent_dim'], result['input_dim'])
-    decoder.load_state_dict(result['decoder_state_dict'])
-    decoder.eval()
-    return decoder
-
+# ---------------------------------------------------------------------------
+# Data reload helpers (raw pixel / count values — same preprocessing as training)
+# ---------------------------------------------------------------------------
 
 def reload_X(ds, subset):
+    """Return (N, features) raw float32 and int labels — matching training indices."""
     rng = np.random.default_rng(42)
     if ds == 'mnist':
-        from torchvision import datasets, transforms
-        mnist = datasets.MNIST(root='./data', train=True, download=True,
-                               transform=transforms.ToTensor())
-        X = mnist.data.numpy().reshape(60000, -1).astype(np.float32) / 255.0
+        from torchvision import datasets
+        mnist = datasets.MNIST(root='./data', train=True, download=True)
+        X = mnist.data.numpy().reshape(60000, -1)
         y = mnist.targets.numpy()
         idx = np.hstack([rng.choice(np.where(y == d)[0],
                                     max(1, int(subset * np.sum(y == d))),
                                     replace=False)
                          for d in np.unique(y)])
-        return X[idx], y[idx]
-    elif ds == 'blood':
+        return X[idx].astype(np.float32), y[idx]
+    else:
         from medmnist import BloodMNIST
         blood = BloodMNIST(split='train', download=True, size=28)
-        X = blood.imgs.reshape(len(blood.imgs), -1).astype(np.float32) / 255.0
+        X = blood.imgs.reshape(len(blood.imgs), -1)
         y = blood.labels.squeeze().astype(int)
         idx = np.hstack([rng.choice(np.where(y == d)[0],
                                     max(1, int(subset * np.sum(y == d))),
                                     replace=False)
                          for d in np.unique(y)])
-        return X[idx], y[idx]
-
-
-def _mixing_weights(Z):
-    """Softmax rows of Z to get per-cell archetype weights summing to 1."""
-    z_shift = Z - Z.max(axis=1, keepdims=True)
-    exp_z = np.exp(z_shift)
-    return exp_z / exp_z.sum(axis=1, keepdims=True)
+        return X[idx].astype(np.float32), y[idx]
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Analyze MIDAA results')
-    parser.add_argument('--dataset', required=True, choices=['mnist', 'blood', 'paul15'])
+    parser = argparse.ArgumentParser(description='Analyze scAAnet results')
+    parser.add_argument('--dataset', required=True,
+                        choices=['mnist', 'blood', 'paul15'])
     parser.add_argument('--k_star', type=int, default=None,
-                        help='Override k* for plots. Default: use n_arc_consistency from results.')
+                        help='Override K* for plots. Default: K_consistency from results.')
     parser.add_argument('--results_path', default=None,
-                        help='Path to results .pt file. Default: results/midaa_{dataset}_results.pt')
+                        help='Path to .pt file. Default: results/scaanet_{dataset}_results.pt')
     parser.add_argument('--outdir', default='results/figures')
     args = parser.parse_args()
 
     if args.results_path is None:
-        args.results_path = f'results/midaa_{args.dataset}_results.pt'
+        args.results_path = f'results/scaanet_{args.dataset}_results.pt'
 
     os.makedirs(args.outdir, exist_ok=True)
     result = torch.load(args.results_path, weights_only=False)
     ds     = args.dataset
     subset = result['subset']
-    prefix = f'midaa_{ds}'
+    prefix = f'scaanet_{ds}'
     label  = LABEL[ds]
 
-    k_star = args.k_star if args.k_star is not None else result['n_arc_consistency']
-    assert k_star in result['n_arc_list'], \
-        f'--k_star={k_star} not in sweep range {result["n_arc_list"]}'
+    k_star = args.k_star if args.k_star is not None else result['K_consistency']
+    assert k_star in result['K_list'], \
+        f'--k_star={k_star} not in sweep range {result["K_list"]}'
 
     # -------------------------------------------------------------------------
-    # 1. ELBO & NMI sweep curves
+    # 1. Reconstruction loss & NMI sweep curves
     # -------------------------------------------------------------------------
 
-    ks        = result['n_arc_list']
-    mean_elbo = result['ELBOs'].mean(axis=1)
-    std_elbo  = result['ELBOs'].std(axis=1)
+    Ks        = result['K_list']
+    mean_loss = result['ReconLosses'].mean(axis=1)
+    std_loss  = result['ReconLosses'].std(axis=1)
     mean_nmi  = result['NMI'].mean(axis=1)
     std_nmi   = result['NMI'].std(axis=1)
 
     fig, axes = plt.subplots(2, 1, figsize=(8, 8))
-    fig.suptitle(f'MIDAA — {label} — Sweep Analysis', fontsize=13, fontweight='bold')
+    fig.suptitle(f'scAAnet — {label} — Sweep Analysis', fontsize=13, fontweight='bold')
 
-    axes[0].plot(ks, mean_elbo, 'b-o', ms=4, lw=1.5)
-    axes[0].fill_between(ks, mean_elbo - std_elbo, mean_elbo + std_elbo, alpha=0.25, color='b')
-    axes[0].axvline(k_star, ls='--', color='gray', lw=1.2, label=f'k*={k_star}')
-    axes[0].set_title('ELBO vs k')
-    axes[0].set_xlabel('Number of archetypes k')
-    axes[0].set_ylabel('ELBO')
+    axes[0].plot(Ks, mean_loss, 'b-o', ms=4, lw=1.5)
+    axes[0].fill_between(Ks, mean_loss - std_loss, mean_loss + std_loss,
+                         alpha=0.25, color='b')
+    axes[0].axvline(k_star, ls='--', color='gray', lw=1.2, label=f'K*={k_star}')
+    axes[0].set_title('Reconstruction Loss (MSE) vs K')
+    axes[0].set_xlabel('Number of archetypes K')
+    axes[0].set_ylabel('Val MSE')
     axes[0].legend(fontsize=8)
     axes[0].grid(True, alpha=0.3)
 
-    axes[1].plot(ks, mean_nmi, 'r-o', ms=4, lw=1.5)
-    axes[1].fill_between(ks, mean_nmi - std_nmi, mean_nmi + std_nmi, alpha=0.25, color='r')
-    axes[1].axvline(k_star, ls='--', color='gray', lw=1.2, label=f'k*={k_star}')
-    axes[1].set_title('NMI Stability vs k')
-    axes[1].set_xlabel('Number of archetypes k')
+    axes[1].plot(Ks, mean_nmi, 'r-o', ms=4, lw=1.5)
+    axes[1].fill_between(Ks, mean_nmi - std_nmi, mean_nmi + std_nmi,
+                         alpha=0.25, color='r')
+    axes[1].axvline(k_star, ls='--', color='gray', lw=1.2, label=f'K*={k_star}')
+    axes[1].set_title('NMI Stability vs K')
+    axes[1].set_xlabel('Number of archetypes K')
     axes[1].set_ylabel('Mean NMI across run pairs')
     axes[1].set_ylim([-0.05, 1.05])
     axes[1].legend(fontsize=8)
     axes[1].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    path = os.path.join(args.outdir, f'{prefix}_elbo_nmi_curves.png')
+    path = os.path.join(args.outdir, f'{prefix}_loss_nmi_curves.png')
     plt.savefig(path, dpi=150, bbox_inches='tight')
     print(f'Saved: {path}')
     plt.close()
 
     # -------------------------------------------------------------------------
-    # 2a. [mnist / blood] Archetype image grids
+    # 2a. [mnist / blood] Archetype image grids  (spectra rows → images)
     # 2b. [paul15]        Archetype gene expression heatmap
+    # archetype_list[0] is (G, K); spectra per archetype = column → XC[:, i]
     # -------------------------------------------------------------------------
 
-    decoder = rebuild_decoder(result)
-    A_t     = torch.tensor(np.array(result['A'])).float()
-
-    with torch.no_grad():
-        decoded = decoder(A_t).numpy()  # (k, features)
-
-    k = decoded.shape[0]
+    XC = np.array(result['archetype_list'][0])   # (G, K)
+    k  = XC.shape[1]
 
     if ds == 'paul15':
-        # Select top 30 genes with highest variance across archetypes (most discriminative)
-        top_n = 30
-        gene_var = decoded.var(axis=0)
-        top_idx  = np.argsort(gene_var)[-top_n:]
-        heatmap  = decoded[:, top_idx]           # (k, top_n)
+        decoded_01 = XC.T.copy()    # (K, G) raw count scale
+        # row-wise min-max to [0,1] for visual comparability
+        row_min = decoded_01.min(axis=1, keepdims=True)
+        row_max = decoded_01.max(axis=1, keepdims=True)
+        decoded_01 = (decoded_01 - row_min) / np.where(
+            row_max - row_min > 0, row_max - row_min, 1.0)
+
+        top_n      = 30
+        top_idx    = np.argsort(decoded_01.var(axis=0))[-top_n:]
+        heatmap    = decoded_01[:, top_idx]
         gene_names = result.get('gene_names', [f'G{i}' for i in top_idx])
         col_labels = [gene_names[i] for i in top_idx]
 
-        fig_h = max(4, 0.45 * k + 1.5)
-        fig_w = max(12, top_n * 0.35)
-        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        fig, ax = plt.subplots(figsize=(max(12, top_n * 0.35), max(4, 0.45 * k + 1.5)))
         fig.suptitle(f'{label} — Archetype Gene Expression (top {top_n} discriminative genes)',
                      fontsize=12, fontweight='bold')
-
         im = ax.imshow(heatmap, aspect='auto', cmap='viridis', vmin=0, vmax=1)
-        plt.colorbar(im, ax=ax, label='Decoded expression [0–1]', fraction=0.03)
+        plt.colorbar(im, ax=ax, label='Row-normalised expression', fraction=0.03)
         ax.set_yticks(range(k))
         ax.set_yticklabels([f'A{i + 1}' for i in range(k)], fontsize=9)
         ax.set_xticks(range(top_n))
@@ -207,11 +183,12 @@ def main():
     else:
         shape = SHAPE[ds]
         fig, axes = plt.subplots(1, k, figsize=(2 * k, 2.5))
-        fig.suptitle(f'{label} Archetypes (k={k})', fontsize=12, fontweight='bold')
+        fig.suptitle(f'{label} Archetypes (K={k})', fontsize=12, fontweight='bold')
 
         for i, ax in enumerate(axes):
-            img = np.clip(decoded[i].reshape(shape), 0, 1)
-            ax.imshow(img, cmap=CMAP[ds])
+            col = XC[:, i].astype(np.float32)
+            col_norm = (col - col.min()) / max(col.max() - col.min(), 1e-8)
+            ax.imshow(np.clip(col_norm.reshape(shape), 0, 1), cmap=CMAP[ds])
             ax.axis('off')
             ax.set_title(f'A{i + 1}', fontsize=9)
 
@@ -222,39 +199,40 @@ def main():
         plt.close()
 
     # -------------------------------------------------------------------------
-    # 3. Latent-space UMAP / PCA of Z
+    # 3. Latent-space UMAP / PCA of per-cell usage weights
+    # usage_list[0] is (N, K) — already simplex-constrained mixing weights
+    # Archetype corners = rows of np.eye(K)
     # -------------------------------------------------------------------------
 
-    Z        = np.array(result['Z'])
+    usage    = np.array(result['usage_list'][0])  # (N, K)
     labels   = np.array(result['labels'])
-    A_arr    = np.array(result['A'])
-    combined = np.vstack([Z, A_arr])
+    corners  = np.eye(k)
+    combined = np.vstack([usage, corners])
 
     method = 'UMAP' if USE_UMAP else 'PCA'
     if USE_UMAP:
-        reducer = umap.UMAP(n_components=2, random_state=42, min_dist=0.1)
-        emb_all = reducer.fit_transform(combined)
+        reducer  = umap.UMAP(n_components=2, random_state=42, min_dist=0.1)
+        emb_all  = reducer.fit_transform(combined)
         xlabel, ylabel = 'UMAP 1', 'UMAP 2'
     else:
-        reducer = PCA(n_components=2)
-        emb_all = reducer.fit_transform(combined)
-        ev      = reducer.explained_variance_ratio_
-        xlabel  = f'PC1 ({ev[0]*100:.1f} %)'
-        ylabel  = f'PC2 ({ev[1]*100:.1f} %)'
+        reducer  = PCA(n_components=2)
+        emb_all  = reducer.fit_transform(combined)
+        ev       = reducer.explained_variance_ratio_
+        xlabel   = f'PC1 ({ev[0]*100:.1f} %)'
+        ylabel   = f'PC2 ({ev[1]*100:.1f} %)'
 
-    emb     = emb_all[:len(Z)]
-    arc_pos = emb_all[len(Z):]
+    emb     = emb_all[:len(usage)]
+    arc_pos = emb_all[len(usage):]
 
-    n_classes  = len(np.unique(labels))
-    cmap_name  = 'tab20' if n_classes > 10 else 'tab10'
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-    fig.suptitle(f'MIDAA — {label} — Latent Space ({method})', fontsize=13, fontweight='bold')
+    n_classes = len(np.unique(labels))
+    fig, ax   = plt.subplots(figsize=(8, 6))
+    fig.suptitle(f'scAAnet — {label} — Latent Space ({method})',
+                 fontsize=13, fontweight='bold')
 
     if ds == 'paul15':
         label_names = result.get('label_names', labels.astype(str))
         unique_ct   = sorted(set(label_names))
-        colors      = plt.get_cmap(cmap_name)(np.linspace(0, 1, len(unique_ct)))
+        colors      = plt.get_cmap('tab20')(np.linspace(0, 1, len(unique_ct)))
         ct_to_col   = {ct: colors[i] for i, ct in enumerate(unique_ct)}
         cell_colors = [ct_to_col[ln] for ln in label_names]
         ax.scatter(emb[:, 0], emb[:, 1], c=cell_colors, alpha=0.5, s=8, linewidths=0)
@@ -263,8 +241,9 @@ def main():
                    for ct in unique_ct]
         ax.legend(handles=handles, fontsize=6, ncol=2, loc='best', title='Cell type')
     else:
-        scatter = ax.scatter(emb[:, 0], emb[:, 1], c=labels, cmap=cmap_name,
-                             alpha=0.55, s=8, linewidths=0)
+        cmap_name = 'tab20' if n_classes > 10 else 'tab10'
+        scatter   = ax.scatter(emb[:, 0], emb[:, 1], c=labels, cmap=cmap_name,
+                               alpha=0.55, s=8, linewidths=0)
         plt.colorbar(scatter, ax=ax, label='class')
 
     ax.scatter(arc_pos[:, 0], arc_pos[:, 1],
@@ -272,7 +251,7 @@ def main():
     for i, (x_, y_) in enumerate(arc_pos):
         ax.annotate(f'A{i + 1}', (x_, y_), fontsize=7, color='red',
                     xytext=(3, 3), textcoords='offset points')
-    ax.set_title(f'{label}  k={result["n_arc_consistency"]}', fontsize=11)
+    ax.set_title(f'{label}  K={k}', fontsize=11)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.3)
@@ -284,11 +263,11 @@ def main():
     plt.close()
 
     # -------------------------------------------------------------------------
-    # 4. Consistency & ISI heatmaps (side by side)
+    # 4. Consistency & ISI heatmaps
     # -------------------------------------------------------------------------
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-    fig.suptitle(f'MIDAA — {label} — Consistency & ISI', fontsize=13, fontweight='bold')
+    fig.suptitle(f'scAAnet — {label} — Consistency & ISI', fontsize=13, fontweight='bold')
 
     for col, (mat_key, title) in enumerate([('consistency_matrix', 'Consistency'),
                                              ('ISI_matrix',          'ISI')]):
@@ -313,31 +292,26 @@ def main():
 
     # -------------------------------------------------------------------------
     # 5. [mnist / blood] Original vs reconstruction image grid
+    # final_recon is (N, G) in raw count scale; divide by 255 to display
     # -------------------------------------------------------------------------
 
     if ds != 'paul15':
-        decoder   = rebuild_decoder(result)
-        X, y_orig = reload_X(ds, subset)
-        Z         = np.array(result['Z'])
-        min_len   = min(len(Z), len(X))
-        Z_t       = torch.tensor(Z[:min_len]).float()
-
-        with torch.no_grad():
-            recon = decoder(Z_t).numpy()
-
-        classes   = np.unique(y_orig[:min_len])
-        n_classes = len(classes)
-        shape     = SHAPE[ds]
-        k         = result['n_arc_consistency']
+        X_orig, y_orig = reload_X(ds, subset)
+        recon          = np.array(result['final_recon'])   # (N, G) raw counts
+        classes        = np.unique(y_orig)
+        n_classes      = len(classes)
+        shape          = SHAPE[ds]
 
         fig, axes = plt.subplots(2, n_classes, figsize=(1.8 * n_classes, 4))
-        fig.suptitle(f'{label} — Original (top) vs Reconstruction (bottom), k={k}',
+        fig.suptitle(f'{label} — Original (top) vs Reconstruction (bottom), K={k}',
                      fontsize=11, fontweight='bold')
 
         for col_i, cls in enumerate(classes):
-            sample_idx = np.where(y_orig[:min_len] == cls)[0][0]
-            orig = np.clip(X[sample_idx].reshape(shape), 0, 1)
-            rec  = np.clip(recon[sample_idx].reshape(shape), 0, 1)
+            sample_idx = np.where(y_orig == cls)[0][0]
+            orig = np.clip(X_orig[sample_idx].reshape(shape) / 255.0, 0, 1)
+            rec  = recon[sample_idx].astype(np.float32)
+            rec  = np.clip((rec - rec.min()) / max(rec.max() - rec.min(), 1e-8), 0, 1)
+            rec  = rec.reshape(shape)
             axes[0, col_i].imshow(orig, cmap=CMAP[ds])
             axes[1, col_i].imshow(rec,  cmap=CMAP[ds])
             axes[0, col_i].set_title(f'cls {cls}', fontsize=8)
@@ -361,28 +335,27 @@ def main():
 
     # -------------------------------------------------------------------------
     # 6. [paul15] Archetype mixing weight distributions per cell type
+    # usage_list[0] is (N, K) — directly the simplex mixing weights; no softmax needed
     # -------------------------------------------------------------------------
 
     if ds == 'paul15':
         if not HAS_SEABORN:
             print('Skipping mixing weight plot — seaborn not installed.')
         else:
-            Z         = np.array(result['Z'])
-            weights   = _mixing_weights(Z)          # (N, k)
-            k         = weights.shape[1]
+            weights     = np.array(result['usage_list'][0])  # (N, K)
+            k_mw        = weights.shape[1]
             label_names = result.get('label_names', result['labels'].astype(str))
+            cell_types  = sorted(set(label_names))
 
             rows = [{'cell_type': label_names[n],
                      'archetype': f'A{arc + 1}',
                      'weight':    float(weights[n, arc])}
                     for n in range(len(weights))
-                    for arc in range(k)]
+                    for arc in range(k_mw)]
             df = pd.DataFrame(rows)
 
-            n_cols  = min(5, k)
-            n_rows  = int(np.ceil(k / n_cols))
-            cell_types = sorted(df['cell_type'].unique())
-
+            n_cols    = min(5, k_mw)
+            n_rows    = int(np.ceil(k_mw / n_cols))
             fig, axes = plt.subplots(n_rows, n_cols,
                                      figsize=(4.5 * n_cols, 3.5 * n_rows),
                                      sharey=True)
@@ -390,9 +363,9 @@ def main():
                          fontsize=13, fontweight='bold')
             axes_flat = np.array(axes).ravel()
 
-            for arc_i in range(k):
-                ax      = axes_flat[arc_i]
-                arc_df  = df[df['archetype'] == f'A{arc_i + 1}']
+            for arc_i in range(k_mw):
+                ax     = axes_flat[arc_i]
+                arc_df = df[df['archetype'] == f'A{arc_i + 1}']
                 sns.violinplot(data=arc_df, x='cell_type', y='weight', ax=ax,
                                order=cell_types, inner='box', color='steelblue', cut=0)
                 ax.set_title(f'A{arc_i + 1}', fontsize=10, fontweight='bold')
@@ -402,7 +375,7 @@ def main():
                 ax.set_ylim(-0.02, 1.02)
                 ax.grid(True, axis='y', alpha=0.3)
 
-            for i in range(k, len(axes_flat)):
+            for i in range(k_mw, len(axes_flat)):
                 axes_flat[i].set_visible(False)
 
             plt.tight_layout()
