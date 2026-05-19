@@ -2,10 +2,10 @@
 MIDAA (Multimodal Archetypal Analysis) training script.
 
 Usage:
-    python MIDAA.py --dataset mnist
-    python MIDAA.py --dataset blood --subset 0.4 --steps 1500
-    python MIDAA.py --dataset paul15 --steps 1500
-    python MIDAA.py --dataset neurips2021 --steps 1500
+    python MIDAA.py --dataset mnist --n_arc 10
+    python MIDAA.py --dataset blood --n_arc 8 --subset 0.4 --steps 1500
+    python MIDAA.py --dataset paul15 --n_arc 10 --steps 1500
+    python MIDAA.py --dataset neurips2021 --n_arc 10 --steps 1500
 
 Saves: results/midaa_{dataset}_results.pt
 
@@ -32,9 +32,7 @@ from utils import preprocess, ArchetypeConsistency, calcNMI
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# ---------------------------------------------------------------------------
 # MLP Decoder
-# ---------------------------------------------------------------------------
 
 class MLPDecoder(nn.Module):
     """General decoder — output_activation defaults to Sigmoid for image data."""
@@ -51,9 +49,7 @@ class MLPDecoder(nn.Module):
         return self.net(z)
 
 
-# ---------------------------------------------------------------------------
 # Data loading
-# ---------------------------------------------------------------------------
 
 def load_mnist(subset):
     import torchvision
@@ -166,9 +162,7 @@ def load_paul15(subset):
     return adata_sub, y[idx]
 
 
-# ---------------------------------------------------------------------------
 # MIDAA fit + decoder training
-# ---------------------------------------------------------------------------
 
 def fit_midaa(X_dense, narchetypes, steps, lr, seed=3):
     N = X_dense.shape[0]
@@ -220,9 +214,7 @@ def train_decoder(decoder, Z, X, epochs=40, batch_size=256, lr=1e-3):
     return history
 
 
-# ---------------------------------------------------------------------------
 # Archetype count sweep
-# ---------------------------------------------------------------------------
 
 def run_sweep(X_dense, name, output_dim, n_arc_list, n_runs, n_arc_consistency,
               R, steps, lr, decoder_epochs):
@@ -301,9 +293,7 @@ def run_sweep(X_dense, name, output_dim, n_arc_list, n_runs, n_arc_consistency,
     }
 
 
-# ---------------------------------------------------------------------------
 # Entry point
-# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description='MIDAA training script')

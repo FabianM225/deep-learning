@@ -1,49 +1,32 @@
-
-## FNNLS update!!
 import torch
 import numpy as np
 torch.set_printoptions(precision=8)
 
 def fastnnls(X,Xty,tol,b,PP,device='cpu'):
-    
-    """
-    Non-negative least squares solver using the fast NNLS algorithm.
-
-    Args:
-        XtX (ndarray): Gram matrix of the input data X.
-        Xty (ndarray): Cross-correlation vector between the input data X and the target variable y.
-        tol (float): Tolerance for the stopping criterion.
-        b (ndarray): Initial guess for the solution.
-
-    Returns:
-        x (ndarray): Solution to the non-negative least squares problem.
-        P (ndarray): Set of active indices in the solution.
-    """
+    # Fast NNLS via active-set method with warm-starting from previous solution PP
 
 
     #device = "cpu"
-    n = X.shape[1] # Number of columns in the input data X.
-    # Tag det gamle aktive sæt, som er de værdier, der ikke er 0. 
+    n = X.shape[1]
+    # Tag det gamle aktive sæt, som er de værdier, der ikke er 0.
 
     if not len(PP):
         P = (torch.empty((n,1), dtype=torch.long,device=device)*np.nan).flatten()
         PP = torch.argwhere(~torch.isnan(P)).flatten()
 
-        Z = torch.arange(1,n+1,dtype=torch.float,device=device) # Initialize the set of candidate indices.
+        Z = torch.arange(1,n+1,dtype=torch.float,device=device)
         ZZ = (Z-1).type(torch.long)
 
     else:
         P = (torch.empty((n,1), dtype=torch.float,device=device)*np.nan).flatten()
         P[PP] = PP.float()
 
-        Z = torch.arange(1,n+1,dtype=torch.float,device=device) # Initialize the set of candidate indices.
+        Z = torch.arange(1,n+1,dtype=torch.float,device=device)
         Z[PP] = np.nan
         ZZ = torch.argwhere(torch.isnan(P)).flatten()
 
-
-    
-    x = b.clone().type(torch.double)   #torch.zeros(n,dtype = torch.double,device=device) # Initialize the solution vector.
-    z = b.clone().type(torch.double)   # Initialize the search direction.
+    x = b.clone().type(torch.double)
+    z = b.clone().type(torch.double)
    
     ij = None
     iterOuter = 0
@@ -52,7 +35,7 @@ def fastnnls(X,Xty,tol,b,PP,device='cpu'):
     lambda1 = 1e6*scale
     lambda2 = 1e-3*scale
     t = X[:,PP]@x[PP]
-    w = Xty +lambda1 - X.T@t - torch.sum(x)*lambda1 - lambda2*x # Compute the gradient of the objective function.
+    w = Xty +lambda1 - X.T@t - torch.sum(x)*lambda1 - lambda2*x
     iter = 0 
     # ændre tol til tol/np.mean(np.diag(XtX))
 
@@ -65,9 +48,9 @@ def fastnnls(X,Xty,tol,b,PP,device='cpu'):
     while(len(ZZ)>0 and torch.sum(w[ZZ]>tol)>0 and iterOuter<1000):
 
         iter = 0
-        temp = w[ZZ] # Select the active gradient components.
-        t = torch.argmax(temp)  # Select the index with the largest gradient.
-        t = ZZ[t] # Convert the index to the original numbering.
+        temp = w[ZZ]
+        t = torch.argmax(temp)
+        t = ZZ[t]
         #P[t] = t # Add the index to the set of active indices.
         #Z[t] = np.nan # Remove the index from the set of candidate indices.
 
@@ -98,13 +81,13 @@ def fastnnls(X,Xty,tol,b,PP,device='cpu'):
         activeSetChange = True
         z = z*0
         #z[PP] = torch.linalg.solve(X[:,PP].T@X[:,PP]*SSt+lamb,Xty[PP]+lamb) # Compute the search direction.
-        z[PP] = torch.linalg.solve(XtX_PP+lambda1+torch.eye(len(PP), device=device)*lambda2,Xty[PP]+lambda1) # Compute the search direction.
+        z[PP] = torch.linalg.solve(XtX_PP+lambda1+torch.eye(len(PP), device=device)*lambda2,Xty[PP]+lambda1)
 
 
         while (torch.sum(z[PP]<=tol)>0 and iter<500): 
 
 
-            temp = torch.argwhere(z[PP] <= tol).T[0] # Select the indices with small search direction.
+            temp = torch.argwhere(z[PP] <= tol).T[0]
 
             QQ =PP[temp] # ]temp[(temp.view(1, -1) == temp2.view(-1, 1)).any(dim=0)]
 
@@ -113,14 +96,12 @@ def fastnnls(X,Xty,tol,b,PP,device='cpu'):
 
             a = x[QQ]/((x[QQ]-z[QQ]))
             a[torch.isnan(a)] = np.inf
-            alpha = torch.min(a) # Compute the step size.
+            alpha = torch.min(a)
 
+            x = x + alpha*(z-x)
 
-            x = x + alpha*(z-x) # Update the solution vector.
-
-
-            t1 = torch.argwhere(x[PP]<tol).flatten() # Select the indices with small solution.
-            ij = PP[t1] # Select the indices with small solution and active indices.
+            t1 = torch.argwhere(x[PP]<tol).flatten()
+            ij = PP[t1]
 
             idx_PP = torch.ones_like(PP).bool() if len(ij)==0 else ~torch.eq(PP[:, None], ij).T[0] 
 
@@ -143,7 +124,7 @@ def fastnnls(X,Xty,tol,b,PP,device='cpu'):
 
             #z[PP] = torch.linalg.solve(X[:,PP].T@X[:,PP]*SSt+lamb,Xty[PP]+lamb) # Compute the search direction.
             z = z*0
-            z[PP] = torch.linalg.solve(XtX_PP+lambda1+torch.eye(len(PP), device=device)*lambda2,Xty[PP]+lambda1) # Compute the search direction.
+            z[PP] = torch.linalg.solve(XtX_PP+lambda1+torch.eye(len(PP), device=device)*lambda2,Xty[PP]+lambda1)
 
 
 

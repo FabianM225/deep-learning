@@ -6,27 +6,8 @@ torch.set_printoptions(precision=8)
 
 
 torch.set_default_dtype(torch.double)
-## S update!! 
 def S_updateTorch(S,CtXtXC,XCtX,SSt,n_arc, n_samples,gridS = False,device = 'cpu'):
-    """
-    Updates the S parameter in archetypal analysis using sequential minimal optimization.
-
-    Args:
-        :S (ndarray): Matrix of archetypes.
-        :type S: ndarray
-        CtXtXC (ndarray): Gram matrix of the transposed input data X.
-        XCtX (ndarray): Cross-correlation matrix between the input data X and the transposed input data X.
-        CtXtX (ndarray): Cross-correlation matrix between the transposed input data X and the target variable y.
-        SST (float): Total sum of squares of the target variable y.
-        SSt (ndarray): Sum of squares of the archetypes.
-        n_arc (int): Number of archetypes.
-        n_samples (int): Number of samples in the input data X.
-
-    Returns:
-        S (ndarray): Updated matrix of archetypes.
-        loss (list): List of loss values.
-        SSt (ndarray): Updated S@S.T matrix.
-    """    
+    # SMO-style S update: iterate over all archetype pairs and solve the 1D subproblem exactly
     #alpha = torch.zeros(n_samples,device = device)
 
 
@@ -62,14 +43,11 @@ def S_updateTorch(S,CtXtXC,XCtX,SSt,n_arc, n_samples,gridS = False,device = 'cpu
 
         nominator = SS[SS>tol] *(hess[0,1]+hess[1,0]-2*hess[1,1]) + d[0][SS>tol] - d[1][SS>tol]
 
-        # Compute the alpha values.
         alpha[SS>tol]  = - torch.divide(nominator,denominator+eta)
 
-        # Clip the values of alpha to the interval [0,1].
         alpha[alpha<0] = 0
         alpha[alpha>1] = 1
 
-        # Update the archetypes using the computed alpha values.
         S[grid[j,0],SS>tol] = SS[SS>tol] * alpha[SS>tol]
         S[grid[j,1],SS>tol] = SS[SS>tol] * (1-alpha[SS>tol])
 
@@ -84,28 +62,8 @@ def S_updateTorch(S,CtXtXC,XCtX,SSt,n_arc, n_samples,gridS = False,device = 'cpu
 
 
 
-## C update!!
-
 def C_updateTorch(X,C,S,SSt,XC,CtXtXC,n_arc,PP,device='cpu'):
-    """
-    Updates the C parameter in archetypal analysis using non-negative least squares.
-
-    Args:
-        C (ndarray): 
-        S (ndarray): 
-        SSt (ndarray): S@S.T
-        XC (ndarray): X@C
-        CtXtXC (ndarray): C.T@X.T@X@C
-        SST (float): Total sum of squares of the full data matrix X.
-        XSt (ndarray): X@S.T .
-        n_arc (int): Number of archetypes.
-        XtX (ndarray): Quadratic matrix.
-
-    Returns:
-        C (ndarray): Updated matrix.
-        loss (list): List of loss values.
-        CtXtXC (ndarray): Updated Gram matrix of the transposed data XC.
-    """
+    # C update: solve one NNLS problem per archetype to find convex data representations
     loss = []
     L = []
 
@@ -129,9 +87,6 @@ def C_updateTorch(X,C,S,SSt,XC,CtXtXC,n_arc,PP,device='cpu'):
 
 
     return C,XC, CtXtXC,PP
-
-
-## AA function!!
 
 
 def AALS(X,n_arc,C=None,S=None,gridS = False,maxIter = 1000,device='cpu'):
